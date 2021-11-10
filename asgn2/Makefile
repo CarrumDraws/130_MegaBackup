@@ -1,7 +1,5 @@
-all: httpserver
-
 httpserver: httpserver.o
-	gcc -g -o httpserver httpserver.o
+	gcc -g -pthread -o httpserver httpserver.o
 
 httpserver.o: httpserver.c
 	gcc -c -std=c99 -Wall -Wextra -Wpedantic -Wshadow httpserver.c

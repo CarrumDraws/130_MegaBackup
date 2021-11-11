@@ -1,9 +1,12 @@
 #include <err.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 #include <unistd.h>
 #include <getopt.h>
+#include <pthread.h>
+#include <semaphore.h>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -13,14 +16,18 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 
-#include <stdio.h>
-
 #define LARGE 10000
 #define SMALL 1000
 
-/**
-   String to int conversion- return 0 if fails
- */
+struct data {
+    int id;
+    int* stack; // How can I store an array into the data struct? Or maybe I just need an int pointer, is that the same thing?
+    pthread_mutex_t* locks; // Is this already by reference? maybe. idk.
+    char* log_file;
+    int* log_length;
+    pthread_mutex_t* logLock;
+};
+
 uint16_t strtouint16(char number[]) {
   char *lastCarriage;
   long num = strtol(number, &lastCarriage, 10);
@@ -30,10 +37,6 @@ uint16_t strtouint16(char number[]) {
   return num;
 }
 
-/**
-   Creates a socket for listening for connections.
-   Closes the program and prints an error message on error.
- */
 int create_listen_socket(uint16_t port) {
   struct sockaddr_in addr;
   int listenfd = socket(AF_INET, SOCK_STREAM, 0);
@@ -269,7 +272,7 @@ void process(char type[], char fileName[], int contLenVal, int connfd) {
   return;
 }
 
-void handle_connection(int connfd) {
+void handle_connection(int connfd, char* log_file, int* log_length, pthread_mutex_t* logLock) {
   char * request = calloc(LARGE, sizeof(char));
   if(request == NULL) {
     send(connfd, "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 22\r\n\r\nInternal Server Error\n", 80, 0);
@@ -310,45 +313,114 @@ void handle_connection(int connfd) {
   printf("-- End of Request --\n");
 }
 
+void producer(int numThreads, int stack[], pthread_mutex_t locks[], int listenfd) {
+  int index = 0;
+  while (1) {
+    int connfd = accept(listenfd, NULL, NULL); // Accept function? What is connfd, is it an HTTP request 0.0
+    if (connfd < 0) {
+      warn("accept error");
+      continue;
+    } else {
+      while(1) {
+        index = index % numThreads;
+        if(stack[index]==0) {
+          pthread_mutex_lock(&locks[index]);
+          stack[index] = connfd;
+          pthread_mutex_unlock(&locks[index]);
+          break;
+        }
+        index++;
+      }        
+    }
+  }
+}
+
+void* consumer(void* arg) {
+  struct data info = *(struct data*)arg;
+  int id = info.id;
+  char* log_file = info.log_file;
+  int* log_length = info.log_length;
+  pthread_mutex_t* logLock;
+  int connfd;
+  while(1) {
+    if(info.stack[id] != 0) {
+      pthread_mutex_lock(&info.locks[id]);
+      connfd = info.stack[id]; // connfd stores the connFD that was stored in stack...
+      info.stack[id] = 0; // ...then sets stack value to 0
+      pthread_mutex_unlock(&info.locks[id]);
+      // printf("Cycle: %d | Thread: %d | Data: %d\n", cycle, id, connfd);
+      handle_connection(connfd, log_file, log_length, logLock);
+      sleep(3);
+    }
+  }
+}
+
 int main(int argc, char *argv[]) {
   int listenfd;
   uint16_t port;
 
   int option;
-  int numThreads = 0;
+  int numThreads = 5;
   char logFile[50];
+  
   while ((option = getopt(argc, argv, "l:N:")) != -1) {
     switch (option) {
       case 'l' : // LogFile Name
         strcpy(logFile, optarg);
-        printf("logFile : %s\n", logFile);
         break;
       case 'N' : // Number of Threads
         numThreads = strtouint16(optarg);
-        printf("numThreads : %d\n", numThreads);
         break;
       default : // Default
+        printf("default : %s\n", optarg);
         break;
     }
   }
+
   // if (argc != 2) {
   //   errx(EXIT_FAILURE, "wrong arguments: %s port_num", argv[0]);
   // }
-  port = strtouint16(argv[1]);
+  port = strtouint16(argv[optind]);
+  printf("logFile : %s\n", logFile);
+  printf("numThreads : %d\n", numThreads);
+  printf("port : %d\n", port); // DEAL WITH OPTIND
   if (port == 0) {
     errx(EXIT_FAILURE, "invalid port number: %s", argv[1]);
   }
   listenfd = create_listen_socket(port);
 
-  // Code here
+  // ----- MULTITHREADING BELOW
 
-  while(1) {
-    int connfd = accept(listenfd, NULL, NULL); // Accept function? What is connfd, is it an HTTP request 0.0
-    if (connfd < 0) {
-      warn("accept error");
-      continue;
-    }
-    handle_connection(connfd);
+  pthread_t threads[numThreads];
+  int stack[numThreads];
+  pthread_mutex_t locks[numThreads];
+
+  for (int x = 0; x < numThreads; x++) {
+      struct data* myData = (struct data*)malloc(sizeof(struct data));
+
+      myData->id = malloc (sizeof(int));
+      myData->stack = (int *) malloc (numThreads * sizeof(int));
+      myData->locks = (pthread_mutex_t *) malloc (numThreads * sizeof(pthread_mutex_t));
+
+      myData->id = x;
+      myData->stack = stack;
+      myData->locks = locks;
+
+      for (int i = 0; i < numThreads; i++) { // for loop to initialize array to 0
+          myData->stack[i] = 0;
+      }
+
+      pthread_mutex_init(&myData->locks[x], NULL);
+      pthread_create(&threads[x], NULL, &consumer, myData);
   }
+  producer(numThreads, stack, locks, listenfd);
+  // while(1) {
+  //   int connfd = accept(listenfd, NULL, NULL); // Accept function? What is connfd, is it an HTTP request 0.0
+  //   if (connfd < 0) {
+  //     warn("accept error");
+  //     continue;
+  //   }
+  //   handle_connection(connfd);
+  // }
   return EXIT_SUCCESS;
 }

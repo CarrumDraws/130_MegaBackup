@@ -1,3 +1,5 @@
+#define _XOPEN_SOURCE 500
+
 #include <err.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -13,6 +15,7 @@
 #include <sys/socket.h>
 
 #include <sys/types.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 
@@ -58,7 +61,34 @@ int create_listen_socket(uint16_t port) {
   return listenfd;
 }
 
-void parse(int connfd, char request[], char type[], char fileName[], char hostVal[], int *contLenVal, int *failCode) {
+void errorLog(char* log_file, int* log_length, pthread_mutex_t* logLock, int connfd, char* code) {
+
+}
+
+void logMsg(char* log_file, int* log_length, pthread_mutex_t* logLock, char* message) {
+  printf("logMsg Start...\n");
+  printf("LogFile: %s\n", log_file);
+  if(!log_file[0]) {
+    return;
+  } else {
+    int logfd = open(log_file, O_WRONLY);
+    int msgLen = strlen(message);
+    int offset = *log_length;
+    printf("log_len: %d, msgLen: %d, offset: %d\n", *log_length, msgLen, offset);
+    // pthread_mutex_lock(logLock);
+    flock(logfd, LOCK_EX);
+    *log_length += msgLen;
+    flock(logfd, LOCK_UN);
+    // pthread_mutex_unlock(logLock);
+    int result = pwrite(logfd, message, msgLen, offset);
+    printf("pwrite result: %d", result);
+    free(message);
+    close(*log_file);
+  }
+  printf("logMsg End\n");
+}
+
+void parse(int connfd, char request[], char type[], char fileName[], char hostVal[], int *contLenVal, int *failCode, char* log_file, int* log_length, pthread_mutex_t* logLock) {
 
   char *currLine = strtok(request, "\r\n");
   if(currLine == NULL) {
@@ -89,68 +119,181 @@ void parse(int connfd, char request[], char type[], char fileName[], char hostVa
   }
 }
 
-void process(char type[], char fileName[], int contLenVal, int connfd) {
+void process(char type[], char fileName[], int contLenVal, int connfd, char* log_file, int* log_length, pthread_mutex_t* logLock, char* hostVal) {
   printf("Processing Type: %s\n", type);
   
   if(strcmp(type, "GET") == 0) { // Return a file to client
     // Check for file, respond 404 if not found
     // If found, respond 200 OK\r\n. Find length of file by reading the whole file into a temporary request first.
     // Should anything fail, clear response, respond 400 Bad Request
-    int fileD = open(fileName, O_RDONLY);
-    
-    if(fileD == -1){
-      send(connfd, "HTTP/1.1 404 File Not Found\r\nContent-Length: 15\r\n\r\nFile Not Found\n", 66, 0); // Send error
-    } else {
-      struct stat buf;
-      fstat(fileD, &buf);
-      off_t fileSize = buf.st_size; // Get fileSize of file
-      printf("Size: %ld\n", fileSize);
 
-      char * fileBuf = calloc(SMALL, sizeof(char)); // Allocate memory for fileBuf
-      if(fileBuf == NULL) {
-        send(connfd, "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 22\r\n\r\nInternal Server Error\n", 80, 0);
-        free(fileBuf);
-        close(fileD); 
-        return;
-      }
-      int bytes = read(fileD, fileBuf, SMALL); // Read the first 1000 byte 'chunk' from the file
+    if(strcmp(fileName, "healthcheck") == 0) {
+      // Healthcheck here
+      pthread_mutex_lock(logLock);
+      // Read 1000 bytes at a time from log_file
+      // Scan for GET, PUT, HEAD, FAIL
+      // Send response
+
+      int fd = open(log_file, O_RDONLY);
+      char* buf = calloc(1000, sizeof(char));
+      char* bufHolder = buf;
+      int fails = 0;
+      int total = 0;
+      int bytes = read(fd, buf, 1000);
       int totalBytesRead = bytes;
-      if(bytes == -1) {
-        send(connfd, "HTTP/1.1 400 Bad Request\r\nContent-Length: 12\r\n\r\nBad Request\n", 60, 0); // Send error if read fails
+
+      while((buf = strstr(buf, "GET\t/"))) {
+          printf("GET FOUND!\n");
+          total++;
+          buf++;
+      }
+      buf = bufHolder;
+      while((buf = strstr(buf, "PUT\t/"))) {
+          printf("PUT FOUND!\n");
+          total++;
+          fails++;
+          buf++;
+      }
+      buf = bufHolder;
+      while((buf = strstr(buf, "HEAD\t/"))) {
+          printf("HEAD FOUND!\n");
+          total++;
+          fails++;
+          buf++;
+      }
+      buf = bufHolder;
+      while((buf = strstr(buf, "FAIL\t/"))) {
+          printf("FAIL FOUND!\n");
+          total++;
+          fails++;
+          buf++;
+      }
+      while(totalBytesRead < *log_length) {
+        bytes = read(fd, buf, 1000);
+        totalBytesRead += bytes;
+        while((buf = strstr(buf, "GET\t/"))) {
+            printf("GET FOUND!\n");
+            total++;
+            buf++;
+        }
+        buf = bufHolder;
+        while((buf = strstr(buf, "PUT\t/"))) {
+            printf("PUT FOUND!\n");
+            total++;
+            fails++;
+            buf++;
+        }
+        buf = bufHolder;
+        while((buf = strstr(buf, "HEAD\t/"))) {
+            printf("HEAD FOUND!\n");
+            total++;
+            fails++;
+            buf++;
+        }
+        buf = bufHolder;
+        while((buf = strstr(buf, "FAIL\t/"))) {
+            printf("FAIL FOUND!\n");
+            total++;
+            fails++;
+            buf++;
+        }
+      }
+
+      free(buf);
+      char* response = calloc(1000, sizeof(char));
+      int msgLen = sprintf(response, "HTTP/1.1 200 OK\r\nContent-Length: TEMPORARY\r\n\r\n%d\n%d\n", fails, total);
+      printf("response: %s\n", response);
+      send(connfd, response, msgLen, 0);
+      free(response);
+      close(fd);
+      pthread_mutex_unlock(logLock);
+
+      //logChunk Here
+      printf("Log Chunk Start\n");
+      char* data = malloc (1000 * sizeof(char));
+      char* convertedData = malloc (3000 * sizeof(char));
+      strcpy(convertedData, "TEMPCONVERTEDDATA");
+      char* message = malloc (10000 * sizeof(char));
+      msgLen = sprintf(message, "GET\t/%s\t%s\t%d\t%s\n", fileName, hostVal, *log_length, convertedData);
+      printf("Message: %s\n", message);
+      logMsg(log_file, log_length, logLock, message);
+      free(data);
+      free(convertedData);
+      printf("Log Chunk End\n");
+
+    } else {
+      int fileD = open(fileName, O_RDONLY);
+      flock(fileD, LOCK_EX);
+      if(fileD == -1){
+        send(connfd, "HTTP/1.1 404 File Not Found\r\nContent-Length: 15\r\n\r\nFile Not Found\n", 66, 0); // Send error
       } else {
-        char * header = calloc(SMALL, sizeof(char));
-        if(header == NULL) {
+        struct stat buf;
+        fstat(fileD, &buf);
+        off_t fileSize = buf.st_size; // Get fileSize of file
+        printf("Size: %ld\n", fileSize);
+
+        char * fileBuf = calloc(SMALL, sizeof(char)); // Allocate memory for fileBuf
+        if(fileBuf == NULL) {
           send(connfd, "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 22\r\n\r\nInternal Server Error\n", 80, 0);
           free(fileBuf);
           close(fileD); 
           return;
         }
-        int headerLen = sprintf(header, "HTTP/1.1 200 OK\r\nContent-Length: %ld\r\n\r\n", fileSize);
-        if(headerLen < 0) {
-          send(connfd, "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 22\r\n\r\nInternal Server Error\n", 80, 0);
-          free(header);
-          free(fileBuf);
-          close(fileD); 
-          return;
-        }
-        send(connfd, header, headerLen, 0); // Send header to response
-        free(header);
-        send(connfd, fileBuf, bytes, 0); // Send current 'chunk' to response
-        while(totalBytesRead < fileSize) {
-          bytes = read(fileD, fileBuf, SMALL); // Read the next 1000 byte chunk
-          if(bytes == -1) {
-            send(connfd, "HTTP/1.1 400 Bad Request\r\nContent-Length: 12\r\n\r\nBad Request\n", 60, 0); // Send error if read fails
+        int bytes = read(fileD, fileBuf, SMALL); // Read the first 1000 byte 'chunk' from the file
+        int totalBytesRead = bytes;
+        if(bytes == -1) {
+          send(connfd, "HTTP/1.1 400 Bad Request\r\nContent-Length: 12\r\n\r\nBad Request\n", 60, 0); // Send error if read fails
+        } else {
+          char * header = calloc(SMALL, sizeof(char));
+          if(header == NULL) {
+            send(connfd, "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 22\r\n\r\nInternal Server Error\n", 80, 0);
             free(fileBuf);
             close(fileD); 
             return;
           }
-          totalBytesRead += bytes;
-          send(connfd, fileBuf, bytes, 0); // Send the 'chunk' to response
+          int headerLen = sprintf(header, "HTTP/1.1 200 OK\r\nContent-Length: %ld\r\n\r\n", fileSize);
+          if(headerLen < 0) {
+            send(connfd, "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 22\r\n\r\nInternal Server Error\n", 80, 0);
+            free(header);
+            free(fileBuf);
+            close(fileD); 
+            return;
+          }
+          send(connfd, header, headerLen, 0); // Send header to response
+          free(header);
+          send(connfd, fileBuf, bytes, 0); // Send current 'chunk' to response
+          while(totalBytesRead < fileSize) {
+            bytes = read(fileD, fileBuf, SMALL); // Read the next 1000 byte chunk
+            if(bytes == -1) {
+              send(connfd, "HTTP/1.1 400 Bad Request\r\nContent-Length: 12\r\n\r\nBad Request\n", 60, 0); // Send error if read fails
+              free(fileBuf);
+              close(fileD); 
+              return;
+            }
+            totalBytesRead += bytes;
+            send(connfd, fileBuf, bytes, 0); // Send the 'chunk' to response
+          }
+          send(connfd, "\n", 1, 0);
         }
-        send(connfd, "\n", 1, 0);
+        free(fileBuf);
+        close(fileD);
+
+        printf("Log Chunk Start\n");
+        // LOG CHUNK
+        char* data = malloc (1000 * sizeof(char));
+        char* convertedData = malloc (3000 * sizeof(char));
+        strcpy(convertedData, "TEMPCONVERTEDDATA");
+        // convertedData = "TEMPCONVERTEDDATA";
+        char* message = malloc (10000 * sizeof(char));
+        //message[0] = '\0';
+        int msgLen = sprintf(message, "GET\t/%s\t%s\t%ld\t%s\n", fileName, hostVal, fileSize, convertedData);
+        printf("Message: %s\n", message);
+        logMsg(log_file, log_length, logLock, message);
+        free(data);
+        free(convertedData);
+        printf("Log Chunk End\n");
       }
-      free(fileBuf);
-      close(fileD); 
+      flock(fileD, LOCK_UN);
     }
     return;
   }
@@ -295,7 +438,7 @@ void handle_connection(int connfd, char* log_file, int* log_length, pthread_mute
   int contLenVal;
   int failCode = 0;
 
-  parse(connfd, request, type, fileName, hostVal, &contLenVal, &failCode);
+  parse(connfd, request, type, fileName, hostVal, &contLenVal, &failCode, log_file, log_length, logLock);
 
   // Fail if hostVal or fileName is invalid
   if(hostVal == 0 || fileName == 0 || failCode == 400) {
@@ -306,7 +449,7 @@ void handle_connection(int connfd, char* log_file, int* log_length, pthread_mute
     return;
   }
 
-  process(type, fileName, contLenVal, connfd);
+  process(type, fileName, contLenVal, connfd, log_file, log_length, logLock, hostVal);
 
   free(request);
   close(connfd);
@@ -336,11 +479,11 @@ void producer(int numThreads, int stack[], pthread_mutex_t locks[], int listenfd
 }
 
 void* consumer(void* arg) {
-  struct data info = *(struct data*)arg;
+  struct data info = *(struct data*)arg; // Should i allocate and deallocate memory here?
   int id = info.id;
   char* log_file = info.log_file;
   int* log_length = info.log_length;
-  pthread_mutex_t* logLock;
+  pthread_mutex_t* logLock = info.logLock;
   int connfd;
   while(1) {
     if(info.stack[id] != 0) {
@@ -350,7 +493,7 @@ void* consumer(void* arg) {
       pthread_mutex_unlock(&info.locks[id]);
       // printf("Cycle: %d | Thread: %d | Data: %d\n", cycle, id, connfd);
       handle_connection(connfd, log_file, log_length, logLock);
-      sleep(3);
+      sleep(1);
     }
   }
 }
@@ -362,6 +505,7 @@ int main(int argc, char *argv[]) {
   int option;
   int numThreads = 5;
   char logFile[50];
+  logFile[0] = '\0';
   
   while ((option = getopt(argc, argv, "l:N:")) != -1) {
     switch (option) {
@@ -377,11 +521,34 @@ int main(int argc, char *argv[]) {
     }
   }
 
-  // if (argc != 2) {
-  //   errx(EXIT_FAILURE, "wrong arguments: %s port_num", argv[0]);
-  // }
   port = strtouint16(argv[optind]);
-  printf("logFile : %s\n", logFile);
+  int log_length = 0;
+
+  if (logFile[0]) {
+    printf("logFile : %s\n", logFile);
+    int exists;
+    if( access( logFile, F_OK ) == 0 ) exists = 1;
+
+    int logFD = open(logFile, O_CREAT|O_WRONLY,  00777);
+    if(exists == 1){
+      printf("Existing Log Found!\n");
+      // Check and Error here v
+      // int counter
+      // for (every 1000 bytes)
+      
+      // Check and Error here ^
+      struct stat buf;
+      fstat(logFD, &buf);
+      log_length = buf.st_size;
+      printf("Size: %d\n", log_length);
+    } else {
+      printf("Creating New Log\n");
+    }  
+    close(logFD);
+  } else {
+    printf("No logFile detected\n");
+  }
+  
   printf("numThreads : %d\n", numThreads);
   printf("port : %d\n", port); // DEAL WITH OPTIND
   if (port == 0) {
@@ -395,6 +562,10 @@ int main(int argc, char *argv[]) {
   int stack[numThreads];
   pthread_mutex_t locks[numThreads];
 
+  pthread_mutex_t* logLock;
+  logLock = (pthread_mutex_t *) malloc (sizeof(pthread_mutex_t));
+  pthread_mutex_init(logLock, NULL);
+
   for (int x = 0; x < numThreads; x++) {
       struct data* myData = (struct data*)malloc(sizeof(struct data));
 
@@ -405,7 +576,10 @@ int main(int argc, char *argv[]) {
       myData->id = x;
       myData->stack = stack;
       myData->locks = locks;
-
+      myData->log_file = logFile;
+      myData->log_length = &log_length;
+      myData->logLock = logLock;
+      
       for (int i = 0; i < numThreads; i++) { // for loop to initialize array to 0
           myData->stack[i] = 0;
       }
@@ -414,13 +588,6 @@ int main(int argc, char *argv[]) {
       pthread_create(&threads[x], NULL, &consumer, myData);
   }
   producer(numThreads, stack, locks, listenfd);
-  // while(1) {
-  //   int connfd = accept(listenfd, NULL, NULL); // Accept function? What is connfd, is it an HTTP request 0.0
-  //   if (connfd < 0) {
-  //     warn("accept error");
-  //     continue;
-  //   }
-  //   handle_connection(connfd);
-  // }
+
   return EXIT_SUCCESS;
 }

@@ -1,3 +1,5 @@
+#define _XOPEN_SOURCE 500
+
 #include <err.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -13,6 +15,7 @@
 #include <sys/socket.h>
 
 #include <sys/types.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 
@@ -58,7 +61,52 @@ int create_listen_socket(uint16_t port) {
   return listenfd;
 }
 
-void parse(int connfd, char request[], char type[], char fileName[], char hostVal[], int *contLenVal, int *failCode) {
+void errorLog(char* log_file, int* log_length, pthread_mutex_t* logLock, char* headerData, char* code) {
+  printf("errorLog Start...\n");
+  if(!log_file[0]) {
+    return;
+  } else {
+    int logfd = open(log_file, O_WRONLY);
+    char* buf = malloc (5000 * sizeof(char));
+    int msgLen = sprintf(buf, "FAIL\t%s\t%s\n", headerData, code);
+    int offset = *log_length;
+    // pthread_mutex_lock(logLock);
+    flock(logfd, LOCK_EX);
+    *log_length += msgLen;
+    flock(logfd, LOCK_UN);
+    // pthread_mutex_unlock(logLock);
+    int result = pwrite(logfd, buf, msgLen, offset);
+    printf("pwrite result: %d", result);
+    free(buf);
+    close(*log_file);
+  }
+  printf("errorLog End\n");
+}
+
+void logMsg(char* log_file, int* log_length, pthread_mutex_t* logLock, char* message) {
+  printf("logMsg Start...\n");
+  printf("LogFile: %s\n", log_file);
+  if(!log_file[0]) {
+    return;
+  } else {
+    int logfd = open(log_file, O_WRONLY);
+    int msgLen = strlen(message);
+    int offset = *log_length;
+    printf("log_len: %d, msgLen: %d, offset: %d\n", *log_length, msgLen, offset);
+    // pthread_mutex_lock(logLock);
+    flock(logfd, LOCK_EX);
+    *log_length += msgLen;
+    flock(logfd, LOCK_UN);
+    // pthread_mutex_unlock(logLock);
+    int result = pwrite(logfd, message, msgLen, offset);
+    printf("pwrite result: %d", result);
+    free(message);
+    close(*log_file);
+  }
+  printf("logMsg End\n");
+}
+
+void parse(int connfd, char request[], char type[], char fileName[], char hostVal[], int *contLenVal, int *failCode, char* log_file, int* log_length, pthread_mutex_t* logLock, char* headerData) {
 
   char *currLine = strtok(request, "\r\n");
   if(currLine == NULL) {
@@ -89,68 +137,178 @@ void parse(int connfd, char request[], char type[], char fileName[], char hostVa
   }
 }
 
-void process(char type[], char fileName[], int contLenVal, int connfd) {
+void process(char type[], char fileName[], int contLenVal, int connfd, char* log_file, int* log_length, pthread_mutex_t* logLock, char* hostVal, char* headerData) {
   printf("Processing Type: %s\n", type);
   
   if(strcmp(type, "GET") == 0) { // Return a file to client
     // Check for file, respond 404 if not found
     // If found, respond 200 OK\r\n. Find length of file by reading the whole file into a temporary request first.
     // Should anything fail, clear response, respond 400 Bad Request
-    int fileD = open(fileName, O_RDONLY);
-    
-    if(fileD == -1){
-      send(connfd, "HTTP/1.1 404 File Not Found\r\nContent-Length: 15\r\n\r\nFile Not Found\n", 66, 0); // Send error
-    } else {
-      struct stat buf;
-      fstat(fileD, &buf);
-      off_t fileSize = buf.st_size; // Get fileSize of file
-      printf("Size: %ld\n", fileSize);
 
-      char * fileBuf = calloc(SMALL, sizeof(char)); // Allocate memory for fileBuf
-      if(fileBuf == NULL) {
-        send(connfd, "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 22\r\n\r\nInternal Server Error\n", 80, 0);
-        free(fileBuf);
-        close(fileD); 
-        return;
-      }
-      int bytes = read(fileD, fileBuf, SMALL); // Read the first 1000 byte 'chunk' from the file
+    if(strcmp(fileName, "healthcheck") == 0) {
+      pthread_mutex_lock(logLock);
+
+      int fd = open(log_file, O_RDONLY);
+      char* buf = calloc(1000, sizeof(char));
+      char* bufHolder = buf;
+      int fails = 0;
+      int total = 0;
+      int bytes = read(fd, buf, 1000);
       int totalBytesRead = bytes;
-      if(bytes == -1) {
-        send(connfd, "HTTP/1.1 400 Bad Request\r\nContent-Length: 12\r\n\r\nBad Request\n", 60, 0); // Send error if read fails
+
+      while((buf = strstr(buf, "GET\t/"))) {
+          total++;
+          buf++;
+      }
+      buf = bufHolder;
+      while((buf = strstr(buf, "PUT\t/"))) {
+          total++;
+          buf++;
+      }
+      buf = bufHolder;
+      while((buf = strstr(buf, "HEAD\t/"))) {
+          total++;
+          buf++;
+      }
+      buf = bufHolder;
+      while((buf = strstr(buf, "FAIL\t/"))) {
+          total++;
+          fails++;
+          buf++;
+      }
+      buf = bufHolder;
+      while(totalBytesRead < *log_length) {
+        bytes = read(fd, buf, 1000);
+        totalBytesRead += bytes;
+        while((buf = strstr(buf, "GET\t/"))) {
+            total++;
+            buf++;
+        }
+        buf = bufHolder;
+        while((buf = strstr(buf, "PUT\t/"))) {
+            total++;
+            buf++;
+        }
+        buf = bufHolder;
+        while((buf = strstr(buf, "HEAD\t/"))) {
+            total++;
+            buf++;
+        }
+        buf = bufHolder;
+        while((buf = strstr(buf, "FAIL\t/"))) {
+            total++;
+            fails++;
+            buf++;
+        }
+        buf = bufHolder;
+      }
+      free(buf);
+      // free(bufHolder);
+      char* response = calloc(1000, sizeof(char));
+      int msgLen = sprintf(response, "HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\n%d\n%d\n", fails, total);
+      printf("Healthcheck: %s\n", response);
+      send(connfd, response, msgLen, 0);
+      free(response);
+      close(fd);
+      
+      //logChunk Here
+      printf("Log Chunk Start\n");
+      int logfileD = open(log_file, O_RDONLY);
+      char* logData = malloc (1000 * sizeof(char));
+      char* convertedData = malloc (3000 * sizeof(char));
+      int logbytes = read(logfileD, logData, 1000);
+      printf("fileName : %s | logfileD: %d | logbytes: %d\n", log_file, logfileD, logbytes);
+      printf("Data: %s\n", logData);
+      for (int i = 0; i < logbytes; i++) {
+        sprintf(&convertedData[i*2],"%02x", logData[i]);
+      }
+      char* message = malloc (10000 * sizeof(char));
+      sprintf(message, "GET\t/%s\t%s\t%d\t%s\n", fileName, hostVal, *log_length, convertedData);
+      printf("Message: %s\n", message);
+      logMsg(log_file, log_length, logLock, message);
+      free(logData);
+      free(convertedData);
+      close(logfileD);
+      printf("Log Chunk End\n");
+      pthread_mutex_unlock(logLock);
+
+    } else {
+      int fileD = open(fileName, O_RDONLY);
+      flock(fileD, LOCK_EX);
+      if(fileD == -1){
+        send(connfd, "HTTP/1.1 404 File Not Found\r\nContent-Length: 15\r\n\r\nFile Not Found\n", 66, 0); // Send error
       } else {
-        char * header = calloc(SMALL, sizeof(char));
-        if(header == NULL) {
+        struct stat buf;
+        fstat(fileD, &buf);
+        off_t fileSize = buf.st_size; // Get fileSize of file
+        printf("Size: %ld\n", fileSize);
+
+        char * fileBuf = calloc(SMALL, sizeof(char)); // Allocate memory for fileBuf
+        if(fileBuf == NULL) {
           send(connfd, "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 22\r\n\r\nInternal Server Error\n", 80, 0);
           free(fileBuf);
           close(fileD); 
           return;
         }
-        int headerLen = sprintf(header, "HTTP/1.1 200 OK\r\nContent-Length: %ld\r\n\r\n", fileSize);
-        if(headerLen < 0) {
-          send(connfd, "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 22\r\n\r\nInternal Server Error\n", 80, 0);
-          free(header);
-          free(fileBuf);
-          close(fileD); 
-          return;
-        }
-        send(connfd, header, headerLen, 0); // Send header to response
-        free(header);
-        send(connfd, fileBuf, bytes, 0); // Send current 'chunk' to response
-        while(totalBytesRead < fileSize) {
-          bytes = read(fileD, fileBuf, SMALL); // Read the next 1000 byte chunk
-          if(bytes == -1) {
-            send(connfd, "HTTP/1.1 400 Bad Request\r\nContent-Length: 12\r\n\r\nBad Request\n", 60, 0); // Send error if read fails
+        int bytes = read(fileD, fileBuf, SMALL); // Read the first 1000 byte 'chunk' from the file
+        int totalBytesRead = bytes;
+        if(bytes == -1) {
+          send(connfd, "HTTP/1.1 400 Bad Request\r\nContent-Length: 12\r\n\r\nBad Request\n", 60, 0); // Send error if read fails
+        } else {
+          char * header = calloc(SMALL, sizeof(char));
+          if(header == NULL) {
+            send(connfd, "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 22\r\n\r\nInternal Server Error\n", 80, 0);
             free(fileBuf);
             close(fileD); 
             return;
           }
-          totalBytesRead += bytes;
-          send(connfd, fileBuf, bytes, 0); // Send the 'chunk' to response
+          int headerLen = sprintf(header, "HTTP/1.1 200 OK\r\nContent-Length: %ld\r\n\r\n", fileSize);
+          if(headerLen < 0) {
+            send(connfd, "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 22\r\n\r\nInternal Server Error\n", 80, 0);
+            free(header);
+            free(fileBuf);
+            close(fileD); 
+            return;
+          }
+          send(connfd, header, headerLen, 0); // Send header to response
+          free(header);
+          send(connfd, fileBuf, bytes, 0); // Send current 'chunk' to response
+          while(totalBytesRead < fileSize) {
+            bytes = read(fileD, fileBuf, SMALL); // Read the next 1000 byte chunk
+            if(bytes == -1) {
+              send(connfd, "HTTP/1.1 400 Bad Request\r\nContent-Length: 12\r\n\r\nBad Request\n", 60, 0); // Send error if read fails
+              free(fileBuf);
+              close(fileD); 
+              return;
+            }
+            totalBytesRead += bytes;
+            send(connfd, fileBuf, bytes, 0); // Send the 'chunk' to response
+          }
+          send(connfd, "\n", 1, 0);
         }
-        send(connfd, "\n", 1, 0);
+        free(fileBuf);
+        close(fileD);
+
+        printf("Log Chunk Start\n");
+        // LOG CHUNK
+        int logfileD = open(fileName, O_RDONLY);
+        char* logData = malloc (1000 * sizeof(char));
+        char* convertedData = malloc (3000 * sizeof(char));
+        int logbytes = read(logfileD, logData, 1000);
+        convertedData[0] = '\0';
+        for (int i = 0; i < logbytes; i++) {
+          sprintf(&convertedData[i*2],"%02x", logData[i]);
+        }
+        char* message = malloc (10000 * sizeof(char));
+        int msgLen = sprintf(message, "GET\t/%s\t%s\t%ld\t%s\n", fileName, hostVal, fileSize, convertedData);
+        printf("Message: %s\n", message);
+        logMsg(log_file, log_length, logLock, message);
+        free(logData);
+        free(convertedData);
+        close(logfileD);
+        printf("Log Chunk End\n");
       }
-      free(fileBuf);
-      close(fileD); 
+      flock(fileD, LOCK_UN);
     }
     return;
   }
@@ -165,55 +323,79 @@ void process(char type[], char fileName[], int contLenVal, int connfd) {
     if (!contLenVal) {
       send(connfd, "HTTP/1.1 400 Bad Request\r\nContent-Length: 12\r\n\r\nBad Request\n", 60, 0); // Send error
     } else {
-      int exists;
-      if( access( fileName, F_OK ) == 0 ) exists = 1;
-
-      int fileD = open(fileName, O_CREAT|O_WRONLY|O_TRUNC,  00777);
-      if(fileD == -1){
-        send(connfd, "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 22\r\n\r\nInternal Server Error\n", 80, 0);
+      if(strcmp(fileName, "healthcheck") == 0) {
+        errorLog(log_file, log_length, logLock, headerData, "403");
+        send(connfd, "HTTP/1.1 403 Forbidden\r\nContent-Length: 10\r\n\r\nForbidden\n", 56, 0);
       } else {
-        char * body = calloc(SMALL, sizeof(char)); // Allocate memory for body
-        if(body == NULL) {
+        int exists;
+        if( access( fileName, F_OK ) == 0 ) exists = 1;
+
+        int fileD = open(fileName, O_CREAT|O_WRONLY|O_TRUNC,  00777);
+        flock(fileD, LOCK_EX);
+        if(fileD == -1){
           send(connfd, "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 22\r\n\r\nInternal Server Error\n", 80, 0);
-          free(body);
-          close(fileD); 
-          return;
-        }
-        int bytes = recv(connfd, body, SMALL, 0);
-        int totalBytesRead = bytes;
-        if(bytes == -1) {
-          send(connfd, "HTTP/1.1 400 Bad Request\r\nContent-Length: 12\r\n\r\nBad Request\n", 60, 0); // Send error if recv fails
         } else {
-          if(write(fileD, body, bytes) == -1) {
+          char * body = calloc(SMALL, sizeof(char)); // Allocate memory for body
+          char* bodyData = malloc (1000 * sizeof(char));
+          if(body == NULL) {
             send(connfd, "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 22\r\n\r\nInternal Server Error\n", 80, 0);
             free(body);
             close(fileD); 
             return;
           }
-          while(totalBytesRead < contLenVal) {
-            bytes = recv(connfd, body, SMALL, 0); //recv X bytes
-            if(bytes == -1) {
-              send(connfd, "HTTP/1.1 400 Bad Request\r\nContent-Length: 12\r\n\r\nBad Request\n", 60, 0); // Send error if read fails
-              free(body);
-              close(fileD); 
-              return;
-            }
-            totalBytesRead += bytes;
+          int bodyBytes = recv(connfd, bodyData, SMALL, MSG_PEEK);
+          printf("Bytes in body: %d\n", bodyBytes);
+          int bytes = recv(connfd, body, SMALL, 0);
+          int totalBytesRead = bytes;
+          if(bytes == -1) {
+            send(connfd, "HTTP/1.1 400 Bad Request\r\nContent-Length: 12\r\n\r\nBad Request\n", 60, 0); // Send error if recv fails
+          } else {
             if(write(fileD, body, bytes) == -1) {
               send(connfd, "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 22\r\n\r\nInternal Server Error\n", 80, 0);
               free(body);
               close(fileD); 
               return;
             }
+            while(totalBytesRead < contLenVal) {
+              bytes = recv(connfd, body, SMALL, 0); //recv X bytes
+              if(bytes == -1) {
+                send(connfd, "HTTP/1.1 400 Bad Request\r\nContent-Length: 12\r\n\r\nBad Request\n", 60, 0); // Send error if read fails
+                free(body);
+                close(fileD); 
+                return;
+              }
+              totalBytesRead += bytes;
+              if(write(fileD, body, bytes) == -1) {
+                send(connfd, "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 22\r\n\r\nInternal Server Error\n", 80, 0);
+                free(body);
+                close(fileD); 
+                return;
+              }
+            }
+            if(exists == 1){
+              send(connfd, "HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nCreated\n", 46, 0); // Otherwise, I send this response
+            } else {
+              send(connfd, "HTTP/1.1 201 Created\r\nContent-Length: 8\r\n\r\nCreated\n", 51, 0); // And send a response.
+            }          
           }
-          if(exists == 1){
-            send(connfd, "HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nCreated\n", 46, 0); // Otherwise, I send this response
-          } else {
-            send(connfd, "HTTP/1.1 201 Created\r\nContent-Length: 8\r\n\r\nCreated\n", 51, 0); // And send a response.
-          }          
+          free(body);
+          close(fileD);
+
+          printf("Log Chunk Start\n");
+          // LOG CHUNK
+          char* convertedData = malloc (3000 * sizeof(char));
+          for (int i = 0; i < bodyBytes; i++) {
+            sprintf(&convertedData[i*2],"%02x", bodyData[i]);
+          }
+          char* message = malloc (10000 * sizeof(char));
+          int msgLen = sprintf(message, "PUT\t/%s\t%s\t%d\t%s\n", fileName, hostVal, contLenVal, convertedData);
+          printf("Message: %s\n", message);
+          logMsg(log_file, log_length, logLock, message);
+          free(bodyData);
+          free(convertedData);
+          printf("Log Chunk End\n");  
         }
-        free(body);
-        close(fileD);
+        flock(fileD, LOCK_UN);
       }
     }
     return;
@@ -224,47 +406,64 @@ void process(char type[], char fileName[], int contLenVal, int connfd) {
     // Check for file, respond 404 if not found
     // If found, respond 200 OK\r\n. Find length of file by reading the whole file into a temporary request first.
     // Should anything fail, clear response, respond 400 Bad Request
-    int fileD = open(fileName, O_RDONLY);
-    
-    if(fileD == -1){
-      send(connfd, "HTTP/1.1 404 File Not Found\r\nContent-Length: 15\r\n\r\nFile Not Found\n", 66, 0); // Send error
-    } else {
-      struct stat buf;
-      fstat(fileD, &buf);
-      off_t fileSize = buf.st_size; // Get fileSize of file
-      printf("Size: %ld\n", fileSize);
 
-      char * fileBuf = calloc(SMALL, sizeof(char)); // Allocate memory for fileBuf
-      if(fileBuf == NULL) {
-        send(connfd, "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 22\r\n\r\nInternal Server Error\n", 80, 0);
+    if(strcmp(fileName, "healthcheck") == 0) {
+      errorLog(log_file, log_length, logLock, headerData, "403");
+      send(connfd, "HTTP/1.1 403 Forbidden\r\nContent-Length: 10\r\n\r\nForbidden\n", 56, 0);
+    } else {
+      int fileD = open(fileName, O_RDONLY);
+      flock(fileD, LOCK_EX);
+      if(fileD == -1){
+        send(connfd, "HTTP/1.1 404 File Not Found\r\nContent-Length: 15\r\n\r\nFile Not Found\n", 66, 0); // Send error
+      } else {
+        struct stat buf;
+        fstat(fileD, &buf);
+        off_t fileSize = buf.st_size; // Get fileSize of file
+        printf("Size: %ld\n", fileSize);
+
+        char * fileBuf = calloc(SMALL, sizeof(char)); // Allocate memory for fileBuf
+        if(fileBuf == NULL) {
+          send(connfd, "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 22\r\n\r\nInternal Server Error\n", 80, 0);
+          free(fileBuf);
+          close(fileD); 
+          return;
+        }
+        int bytes = read(fileD, fileBuf, SMALL); // Read the first 1000 byte 'chunk' from the file
+        if(bytes == -1) {
+          send(connfd, "HTTP/1.1 400 Bad Request\r\nContent-Length: 12\r\n\r\nBad Request\n", 60, 0); // Send error if read fails
+        } else {
+          char * header = calloc(SMALL, sizeof(char));
+          if(header == NULL) {
+            send(connfd, "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 22\r\n\r\nInternal Server Error\n", 80, 0);
+            free(fileBuf);
+            close(fileD); 
+            return;
+          }
+          int headerLen = sprintf(header, "HTTP/1.1 200 OK\r\nContent-Length: %ld\r\n\r\n", fileSize);
+          if(headerLen < 0) {
+            send(connfd, "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 22\r\n\r\nInternal Server Error\n", 80, 0);
+            free(header);
+            free(fileBuf);
+            close(fileD); 
+            return;
+          }
+          send(connfd, header, headerLen, 0); // Send header to response
+          free(header);
+        }
         free(fileBuf);
         close(fileD); 
-        return;
+
+        printf("Log Chunk Start\n");
+        // LOG CHUNK
+        int logfileD = open(fileName, O_RDONLY);
+        char* message = malloc (10000 * sizeof(char));
+        int msgLen = sprintf(message, "HEAD\t/%s\t%s\t%ld\n", fileName, hostVal, fileSize);
+        printf("Message: %s\n", message);
+        logMsg(log_file, log_length, logLock, message);
+        close(logfileD);
+        printf("Log Chunk End\n");
       }
-      int bytes = read(fileD, fileBuf, SMALL); // Read the first 1000 byte 'chunk' from the file
-      if(bytes == -1) {
-        send(connfd, "HTTP/1.1 400 Bad Request\r\nContent-Length: 12\r\n\r\nBad Request\n", 60, 0); // Send error if read fails
-      } else {
-        char * header = calloc(SMALL, sizeof(char));
-        if(header == NULL) {
-          send(connfd, "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 22\r\n\r\nInternal Server Error\n", 80, 0);
-          free(fileBuf);
-          close(fileD); 
-          return;
-        }
-        int headerLen = sprintf(header, "HTTP/1.1 200 OK\r\nContent-Length: %ld\r\n\r\n", fileSize);
-        if(headerLen < 0) {
-          send(connfd, "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 22\r\n\r\nInternal Server Error\n", 80, 0);
-          free(header);
-          free(fileBuf);
-          close(fileD); 
-          return;
-        }
-        send(connfd, header, headerLen, 0); // Send header to response
-        free(header);
-      }
-      free(fileBuf);
-      close(fileD); 
+      flock(fileD, LOCK_UN);
     }
     return;
   }
@@ -273,7 +472,14 @@ void process(char type[], char fileName[], int contLenVal, int connfd) {
 }
 
 void handle_connection(int connfd, char* log_file, int* log_length, pthread_mutex_t* logLock) {
+  printf("In handle_connection\n");
   char * request = calloc(LARGE, sizeof(char));
+  char* tempHeader = malloc (1000 * sizeof(char));
+  char* headerData = malloc (1000 * sizeof(char));
+  recv(connfd, tempHeader, SMALL, MSG_PEEK);  
+  // Break based on strtok
+  headerData = strtok(tempHeader, "\r\n");
+  // free(tempHeader);
   if(request == NULL) {
     send(connfd, "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 22\r\n\r\nInternal Server Error\n", 80, 0);
     free(request);
@@ -295,7 +501,7 @@ void handle_connection(int connfd, char* log_file, int* log_length, pthread_mute
   int contLenVal;
   int failCode = 0;
 
-  parse(connfd, request, type, fileName, hostVal, &contLenVal, &failCode);
+  parse(connfd, request, type, fileName, hostVal, &contLenVal, &failCode, log_file, log_length, logLock, headerData);
 
   // Fail if hostVal or fileName is invalid
   if(hostVal == 0 || fileName == 0 || failCode == 400) {
@@ -306,8 +512,9 @@ void handle_connection(int connfd, char* log_file, int* log_length, pthread_mute
     return;
   }
 
-  process(type, fileName, contLenVal, connfd);
+  process(type, fileName, contLenVal, connfd, log_file, log_length, logLock, hostVal, headerData);
 
+  free(headerData);
   free(request);
   close(connfd);
   printf("-- End of Request --\n");
@@ -336,11 +543,11 @@ void producer(int numThreads, int stack[], pthread_mutex_t locks[], int listenfd
 }
 
 void* consumer(void* arg) {
-  struct data info = *(struct data*)arg;
+  struct data info = *(struct data*)arg; // Should i allocate and deallocate memory here?
   int id = info.id;
   char* log_file = info.log_file;
   int* log_length = info.log_length;
-  pthread_mutex_t* logLock;
+  pthread_mutex_t* logLock = info.logLock;
   int connfd;
   while(1) {
     if(info.stack[id] != 0) {
@@ -350,7 +557,7 @@ void* consumer(void* arg) {
       pthread_mutex_unlock(&info.locks[id]);
       // printf("Cycle: %d | Thread: %d | Data: %d\n", cycle, id, connfd);
       handle_connection(connfd, log_file, log_length, logLock);
-      sleep(3);
+      sleep(1);
     }
   }
 }
@@ -362,6 +569,7 @@ int main(int argc, char *argv[]) {
   int option;
   int numThreads = 5;
   char logFile[50];
+  logFile[0] = '\0';
   
   while ((option = getopt(argc, argv, "l:N:")) != -1) {
     switch (option) {
@@ -377,11 +585,69 @@ int main(int argc, char *argv[]) {
     }
   }
 
-  // if (argc != 2) {
-  //   errx(EXIT_FAILURE, "wrong arguments: %s port_num", argv[0]);
-  // }
   port = strtouint16(argv[optind]);
-  printf("logFile : %s\n", logFile);
+  int log_length = 0;
+
+  if (logFile[0]) {
+    printf("logFile : %s\n", logFile);
+    int exists;
+    if( access( logFile, F_OK ) == 0 ) exists = 1;
+
+    int logFD = open(logFile, O_CREAT|O_RDONLY, 00777);
+    if(exists == 1){
+      printf("Existing Log Found!\n");
+      struct stat buf;
+      fstat(logFD, &buf);
+      log_length = buf.st_size;
+      printf("Log File Size: %d\n", log_length);
+      int tabs = 0;
+      char* logArr = calloc(1000, sizeof(char));
+      int bytes = read(logFD, logArr, log_length);
+      int totalBytesRead = bytes;
+      for(int x = 0; x < bytes; x++) {
+        if(logArr[x] == '\n') {
+          if(tabs != 2 && tabs != 3 && tabs != 4) {
+            close(logFD);
+            errx(EXIT_FAILURE, "invalid log_file: %s", logFile);
+          } else {
+            tabs = 0;
+          }
+        }
+        if(logArr[x] == '\t') {
+          tabs++;
+        } 
+      }
+      printf("totalBytesRead : %d\n", totalBytesRead);
+
+      while(totalBytesRead < log_length) {
+        printf("totalBytesRead : %d", totalBytesRead);
+        bytes = read(logFD, logArr, log_length);
+        totalBytesRead = bytes;
+        for(int x = 0; x < bytes; x++) {
+          if(logArr[x] == '\n') {
+            if(tabs != 3 && tabs != 4) {
+              close(logFD);
+              errx(EXIT_FAILURE, "invalid log_file: %s", logFile);
+            } else {
+              tabs = 0;
+            }
+          }
+          if(logArr[x] == '\t') {
+            tabs++;
+          } 
+        }
+      }
+      free(logArr);
+      // Check and Error here ^
+
+    } else {
+      printf("Creating New Log\n");
+    }  
+    close(logFD);
+  } else {
+    printf("No logFile detected\n");
+  }
+  
   printf("numThreads : %d\n", numThreads);
   printf("port : %d\n", port); // DEAL WITH OPTIND
   if (port == 0) {
@@ -395,6 +661,10 @@ int main(int argc, char *argv[]) {
   int stack[numThreads];
   pthread_mutex_t locks[numThreads];
 
+  pthread_mutex_t* logLock;
+  logLock = (pthread_mutex_t *) malloc (sizeof(pthread_mutex_t));
+  pthread_mutex_init(logLock, NULL);
+
   for (int x = 0; x < numThreads; x++) {
       struct data* myData = (struct data*)malloc(sizeof(struct data));
 
@@ -405,7 +675,10 @@ int main(int argc, char *argv[]) {
       myData->id = x;
       myData->stack = stack;
       myData->locks = locks;
-
+      myData->log_file = logFile;
+      myData->log_length = &log_length;
+      myData->logLock = logLock;
+      
       for (int i = 0; i < numThreads; i++) { // for loop to initialize array to 0
           myData->stack[i] = 0;
       }
@@ -414,13 +687,6 @@ int main(int argc, char *argv[]) {
       pthread_create(&threads[x], NULL, &consumer, myData);
   }
   producer(numThreads, stack, locks, listenfd);
-  // while(1) {
-  //   int connfd = accept(listenfd, NULL, NULL); // Accept function? What is connfd, is it an HTTP request 0.0
-  //   if (connfd < 0) {
-  //     warn("accept error");
-  //     continue;
-  //   }
-  //   handle_connection(connfd);
-  // }
+
   return EXIT_SUCCESS;
 }

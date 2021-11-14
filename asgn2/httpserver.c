@@ -357,6 +357,7 @@ void process(char type[], char fileName[], int contLenVal, int connfd, char* log
               return;
             }
             while(totalBytesRead < contLenVal) {
+              printf("totalBytesRead: %d | contLenVal: %d", totalBytesRead, contLenVal);
               bytes = recv(connfd, body, SMALL, 0); //recv X bytes
               if(bytes == -1) {
                 send(connfd, "HTTP/1.1 400 Bad Request\r\nContent-Length: 12\r\n\r\nBad Request\n", 60, 0); // Send error if read fails
@@ -522,8 +523,8 @@ void handle_connection(int connfd, char* log_file, int* log_length, pthread_mute
 
 void producer(int numThreads, int stack[], pthread_mutex_t locks[], int listenfd) {
   int index = 0;
-  while (1) {
-    int connfd = accept(listenfd, NULL, NULL); // Accept function? What is connfd, is it an HTTP request 0.0
+  while(1) {
+    int connfd = accept(listenfd, NULL, NULL);
     if (connfd < 0) {
       warn("accept error");
       continue;
@@ -543,19 +544,18 @@ void producer(int numThreads, int stack[], pthread_mutex_t locks[], int listenfd
 }
 
 void* consumer(void* arg) {
-  struct data info = *(struct data*)arg; // Should i allocate and deallocate memory here?
-  int id = info.id;
-  char* log_file = info.log_file;
-  int* log_length = info.log_length;
-  pthread_mutex_t* logLock = info.logLock;
+  struct data* info = (struct data*)arg; 
+  int id = info->id;
+  char* log_file = info->log_file;
+  int* log_length = info->log_length;
+  pthread_mutex_t* logLock = info->logLock;
   int connfd;
   while(1) {
-    if(info.stack[id] != 0) {
-      pthread_mutex_lock(&info.locks[id]);
-      connfd = info.stack[id]; // connfd stores the connFD that was stored in stack...
-      info.stack[id] = 0; // ...then sets stack value to 0
-      pthread_mutex_unlock(&info.locks[id]);
-      // printf("Cycle: %d | Thread: %d | Data: %d\n", cycle, id, connfd);
+    if(info->stack[id] != 0) {
+      pthread_mutex_lock(&info->locks[id]);
+      connfd = info->stack[id]; // connfd stores the connFD that was stored in stack...
+      info->stack[id] = 0; // ...then sets stack value to 0
+      pthread_mutex_unlock(&info->locks[id]);
       handle_connection(connfd, log_file, log_length, logLock);
       sleep(1);
     }

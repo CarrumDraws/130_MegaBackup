@@ -28,7 +28,6 @@ struct data {
     pthread_mutex_t* locks; // Is this already by reference? maybe. idk.
     char* log_file;
     int* log_length;
-    pthread_mutex_t* logLock;
 };
 
 uint16_t strtouint16(char number[]) {
@@ -61,7 +60,7 @@ int create_listen_socket(uint16_t port) {
   return listenfd;
 }
 
-void errorLog(char* log_file, int* log_length, pthread_mutex_t* logLock, char* headerData, char* code) {
+void errorLog(char* log_file, int* log_length, char* headerData, char* code) {
   printf("errorLog Start...\n");
   if(!log_file[0]) {
     return;
@@ -70,11 +69,9 @@ void errorLog(char* log_file, int* log_length, pthread_mutex_t* logLock, char* h
     char* buf = malloc (5000 * sizeof(char));
     int msgLen = sprintf(buf, "FAIL\t%s\t%s\n", headerData, code);
     int offset = *log_length;
-    // pthread_mutex_lock(logLock);
     flock(logfd, LOCK_EX);
     *log_length += msgLen;
     flock(logfd, LOCK_UN);
-    // pthread_mutex_unlock(logLock);
     int result = pwrite(logfd, buf, msgLen, offset);
     printf("pwrite result: %d", result);
     free(buf);
@@ -83,7 +80,7 @@ void errorLog(char* log_file, int* log_length, pthread_mutex_t* logLock, char* h
   printf("errorLog End\n");
 }
 
-void logMsg(char* log_file, int* log_length, pthread_mutex_t* logLock, char* message) {
+void logMsg(char* log_file, int* log_length, char* message) {
   printf("logMsg Start...\n");
   printf("LogFile: %s\n", log_file);
   if(!log_file[0]) {
@@ -93,11 +90,9 @@ void logMsg(char* log_file, int* log_length, pthread_mutex_t* logLock, char* mes
     int msgLen = strlen(message);
     int offset = *log_length;
     printf("log_len: %d, msgLen: %d, offset: %d\n", *log_length, msgLen, offset);
-    // pthread_mutex_lock(logLock);
     flock(logfd, LOCK_EX);
     *log_length += msgLen;
     flock(logfd, LOCK_UN);
-    // pthread_mutex_unlock(logLock);
     int result = pwrite(logfd, message, msgLen, offset);
     printf("pwrite result: %d", result);
     free(message);
@@ -106,7 +101,7 @@ void logMsg(char* log_file, int* log_length, pthread_mutex_t* logLock, char* mes
   printf("logMsg End\n");
 }
 
-void parse(int connfd, char request[], char type[], char fileName[], char hostVal[], int *contLenVal, int *failCode, char* log_file, int* log_length, pthread_mutex_t* logLock, char* headerData) {
+void parse(int connfd, char request[], char type[], char fileName[], char hostVal[], int *contLenVal, int *failCode, char* log_file, int* log_length, char* headerData) {
 
   char *currLine = strtok(request, "\r\n");
   if(currLine == NULL) {
@@ -137,7 +132,7 @@ void parse(int connfd, char request[], char type[], char fileName[], char hostVa
   }
 }
 
-void process(char type[], char fileName[], int contLenVal, int connfd, char* log_file, int* log_length, pthread_mutex_t* logLock, char* hostVal, char* headerData) {
+void process(char type[], char fileName[], int contLenVal, int connfd, char* log_file, int* log_length, char* hostVal, char* headerData) {
   printf("Processing Type: %s\n", type);
   
   if(strcmp(type, "GET") == 0) { // Return a file to client
@@ -146,8 +141,6 @@ void process(char type[], char fileName[], int contLenVal, int connfd, char* log
     // Should anything fail, clear response, respond 400 Bad Request
 
     if(strcmp(fileName, "healthcheck") == 0) {
-      pthread_mutex_lock(logLock);
-
       int fd = open(log_file, O_RDONLY);
       char* buf = calloc(1000, sizeof(char));
       char* bufHolder = buf;
@@ -203,7 +196,6 @@ void process(char type[], char fileName[], int contLenVal, int connfd, char* log
         buf = bufHolder;
       }
       free(buf);
-      // free(bufHolder);
       char* response = calloc(1000, sizeof(char));
       int msgLen = sprintf(response, "HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\n%d\n%d\n", fails, total);
       printf("Healthcheck: %s\n", response);
@@ -214,6 +206,7 @@ void process(char type[], char fileName[], int contLenVal, int connfd, char* log
       //logChunk Here
       printf("Log Chunk Start\n");
       int logfileD = open(log_file, O_RDONLY);
+      //flock(logfileD, LOCK_EX);
       char* logData = malloc (1000 * sizeof(char));
       char* convertedData = malloc (3000 * sizeof(char));
       int logbytes = read(logfileD, logData, 1000);
@@ -225,12 +218,12 @@ void process(char type[], char fileName[], int contLenVal, int connfd, char* log
       char* message = malloc (10000 * sizeof(char));
       sprintf(message, "GET\t/%s\t%s\t%d\t%s\n", fileName, hostVal, *log_length, convertedData);
       printf("Message: %s\n", message);
-      logMsg(log_file, log_length, logLock, message);
+      logMsg(log_file, log_length, message);
       free(logData);
       free(convertedData);
+      //flock(logfileD, LOCK_UN);
       close(logfileD);
       printf("Log Chunk End\n");
-      pthread_mutex_unlock(logLock);
 
     } else {
       int fileD = open(fileName, O_RDONLY);
@@ -302,7 +295,7 @@ void process(char type[], char fileName[], int contLenVal, int connfd, char* log
         char* message = malloc (10000 * sizeof(char));
         int msgLen = sprintf(message, "GET\t/%s\t%s\t%ld\t%s\n", fileName, hostVal, fileSize, convertedData);
         printf("Message: %s\n", message);
-        logMsg(log_file, log_length, logLock, message);
+        logMsg(log_file, log_length, message);
         free(logData);
         free(convertedData);
         close(logfileD);
@@ -324,7 +317,7 @@ void process(char type[], char fileName[], int contLenVal, int connfd, char* log
       send(connfd, "HTTP/1.1 400 Bad Request\r\nContent-Length: 12\r\n\r\nBad Request\n", 60, 0); // Send error
     } else {
       if(strcmp(fileName, "healthcheck") == 0) {
-        errorLog(log_file, log_length, logLock, headerData, "403");
+        errorLog(log_file, log_length, headerData, "403");
         send(connfd, "HTTP/1.1 403 Forbidden\r\nContent-Length: 10\r\n\r\nForbidden\n", 56, 0);
       } else {
         int exists;
@@ -391,7 +384,7 @@ void process(char type[], char fileName[], int contLenVal, int connfd, char* log
           char* message = malloc (10000 * sizeof(char));
           int msgLen = sprintf(message, "PUT\t/%s\t%s\t%d\t%s\n", fileName, hostVal, contLenVal, convertedData);
           printf("Message: %s\n", message);
-          logMsg(log_file, log_length, logLock, message);
+          logMsg(log_file, log_length, message);
           free(bodyData);
           free(convertedData);
           printf("Log Chunk End\n");  
@@ -409,7 +402,7 @@ void process(char type[], char fileName[], int contLenVal, int connfd, char* log
     // Should anything fail, clear response, respond 400 Bad Request
 
     if(strcmp(fileName, "healthcheck") == 0) {
-      errorLog(log_file, log_length, logLock, headerData, "403");
+      errorLog(log_file, log_length, headerData, "403");
       send(connfd, "HTTP/1.1 403 Forbidden\r\nContent-Length: 10\r\n\r\nForbidden\n", 56, 0);
     } else {
       int fileD = open(fileName, O_RDONLY);
@@ -460,7 +453,7 @@ void process(char type[], char fileName[], int contLenVal, int connfd, char* log
         char* message = malloc (10000 * sizeof(char));
         int msgLen = sprintf(message, "HEAD\t/%s\t%s\t%ld\n", fileName, hostVal, fileSize);
         printf("Message: %s\n", message);
-        logMsg(log_file, log_length, logLock, message);
+        logMsg(log_file, log_length, message);
         close(logfileD);
         printf("Log Chunk End\n");
       }
@@ -472,15 +465,13 @@ void process(char type[], char fileName[], int contLenVal, int connfd, char* log
   return;
 }
 
-void handle_connection(int connfd, char* log_file, int* log_length, pthread_mutex_t* logLock) {
+void handle_connection(int connfd, char* log_file, int* log_length) {
   printf("In handle_connection\n");
   char * request = calloc(LARGE, sizeof(char));
   char* tempHeader = malloc (1000 * sizeof(char));
   char* headerData = malloc (1000 * sizeof(char));
   recv(connfd, tempHeader, SMALL, MSG_PEEK);  
-  // Break based on strtok
   headerData = strtok(tempHeader, "\r\n");
-  // free(tempHeader);
   if(request == NULL) {
     send(connfd, "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 22\r\n\r\nInternal Server Error\n", 80, 0);
     free(request);
@@ -502,7 +493,7 @@ void handle_connection(int connfd, char* log_file, int* log_length, pthread_mute
   int contLenVal;
   int failCode = 0;
 
-  parse(connfd, request, type, fileName, hostVal, &contLenVal, &failCode, log_file, log_length, logLock, headerData);
+  parse(connfd, request, type, fileName, hostVal, &contLenVal, &failCode, log_file, log_length, headerData);
 
   // Fail if hostVal or fileName is invalid
   if(hostVal == 0 || fileName == 0 || failCode == 400) {
@@ -513,7 +504,7 @@ void handle_connection(int connfd, char* log_file, int* log_length, pthread_mute
     return;
   }
 
-  process(type, fileName, contLenVal, connfd, log_file, log_length, logLock, hostVal, headerData);
+  process(type, fileName, contLenVal, connfd, log_file, log_length, hostVal, headerData);
 
   free(headerData);
   free(request);
@@ -545,10 +536,11 @@ void producer(int numThreads, int stack[], pthread_mutex_t locks[], int listenfd
 
 void* consumer(void* arg) {
   struct data* info = (struct data*)arg; 
-  int id = info->id;
-  char* log_file = info->log_file;
+  int id = malloc (sizeof(int));
+  id = info->id;
+  char* log_file = malloc (3000 * sizeof(char));
+  log_file = info->log_file;
   int* log_length = info->log_length;
-  pthread_mutex_t* logLock = info->logLock;
   int connfd;
   while(1) {
     if(info->stack[id] != 0) {
@@ -556,7 +548,7 @@ void* consumer(void* arg) {
       connfd = info->stack[id]; // connfd stores the connFD that was stored in stack...
       info->stack[id] = 0; // ...then sets stack value to 0
       pthread_mutex_unlock(&info->locks[id]);
-      handle_connection(connfd, log_file, log_length, logLock);
+      handle_connection(connfd, log_file, log_length);
       sleep(1);
     }
   }
@@ -661,10 +653,6 @@ int main(int argc, char *argv[]) {
   int stack[numThreads];
   pthread_mutex_t locks[numThreads];
 
-  pthread_mutex_t* logLock;
-  logLock = (pthread_mutex_t *) malloc (sizeof(pthread_mutex_t));
-  pthread_mutex_init(logLock, NULL);
-
   for (int x = 0; x < numThreads; x++) {
       struct data* myData = (struct data*)malloc(sizeof(struct data));
 
@@ -677,12 +665,10 @@ int main(int argc, char *argv[]) {
       myData->locks = locks;
       myData->log_file = logFile;
       myData->log_length = &log_length;
-      myData->logLock = logLock;
       
       for (int i = 0; i < numThreads; i++) { // for loop to initialize array to 0
           myData->stack[i] = 0;
       }
-
       pthread_mutex_init(&myData->locks[x], NULL);
       pthread_create(&threads[x], NULL, &consumer, myData);
   }
